@@ -4,28 +4,36 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.database.ContentObserver;
 import android.database.Cursor;
-import android.graphics.BitmapFactory;
 import android.graphics.Point;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Display;
 import android.view.WindowManager;
 
+import androidx.annotation.NonNull;
+
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+
+import io.reactivex.Single;
+import io.reactivex.SingleObserver;
+import io.reactivex.SingleOnSubscribe;
+import io.reactivex.android.schedulers.AndroidSchedulers;
+import io.reactivex.disposables.Disposable;
+import io.reactivex.schedulers.Schedulers;
 
 /**
  * Created by xuwenbin on 2021/6/15 3:33 下午.
  */
 public class ScreenShotListenManager {
 
-    private final String TAG = "ScreenShotListenManager";
+    private static final String TAG = "ScreenShotListenManager";
 
     /**
      * 读取媒体数据库时需要读取的列, 其中 WIDTH 和 HEIGHT 字段在 API 16 以后才有
@@ -69,10 +77,6 @@ public class ScreenShotListenManager {
      */
     private MediaContentObserver mExternalObserver;
 
-    /**
-     * 运行在 UI 线程的 Handler, 用于运行监听器回调
-     */
-    private final Handler mUiHandler = new Handler(Looper.getMainLooper());
 
     public ScreenShotListenManager(Context context) {
         if (context == null) {
@@ -83,33 +87,20 @@ public class ScreenShotListenManager {
         // 获取屏幕真实的分辨率
         if (sScreenRealSize == null) {
             sScreenRealSize = getRealScreenSize();
-            if (sScreenRealSize != null) {
-                Log.d(TAG, "Screen Real Size: " + sScreenRealSize.x + " * " + sScreenRealSize.y);
-            } else {
-                Log.w(TAG, "Get screen real size failed.");
-            }
         }
-    }
-
-    public static ScreenShotListenManager newInstance(Context context) {
-        assertInMainThread();
-        return new ScreenShotListenManager(context);
     }
 
     /**
      * 启动监听
      */
     public void startListen() {
-        assertInMainThread();
-
         sHasCallbackPaths.clear();
 
         // 记录开始监听的时间戳
         mStartListenTime = System.currentTimeMillis();
-
         // 创建内容观察者
-        mInternalObserver = new MediaContentObserver(MediaStore.Images.Media.INTERNAL_CONTENT_URI, mUiHandler);
-        mExternalObserver = new MediaContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, mUiHandler);
+        mInternalObserver = new MediaContentObserver(MediaStore.Images.Media.INTERNAL_CONTENT_URI, null);
+        mExternalObserver = new MediaContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null);
 
         // 注册内容观察者
         mContext.getContentResolver().registerContentObserver(
@@ -128,10 +119,8 @@ public class ScreenShotListenManager {
      * 停止监听
      */
     public void stopListen() {
-        assertInMainThread();
-
         // 注销内容观察者
-        if (mInternalObserver != null) {
+        if (mInternalObserver != null && mContext != null) {
             try {
                 mContext.getContentResolver().unregisterContentObserver(mInternalObserver);
             } catch (Exception e) {
@@ -139,7 +128,7 @@ public class ScreenShotListenManager {
             }
             mInternalObserver = null;
         }
-        if (mExternalObserver != null) {
+        if (mExternalObserver != null && mContext != null) {
             try {
                 mContext.getContentResolver().unregisterContentObserver(mExternalObserver);
             } catch (Exception e) {
@@ -156,7 +145,7 @@ public class ScreenShotListenManager {
     /**
      * 处理媒体数据库的内容改变
      */
-    private void handleMediaContentChange(Uri contentUri) {
+    private ScreenData handleMediaContentChange(Uri contentUri) {
         Cursor cursor = null;
         try {
             // 数据改变时查询数据库中最后加入的一条数据
@@ -185,12 +174,10 @@ public class ScreenShotListenManager {
 
 
             if (cursor == null) {
-                Log.e(TAG, "-----------Deviant logic.");
-                return;
+                return null;
             }
             if (!cursor.moveToFirst()) {
-                Log.d(TAG, "----------Cursor no data.");
-                return;
+                return null;
             }
 
             // 获取各列的索引
@@ -205,25 +192,12 @@ public class ScreenShotListenManager {
             // 获取行数据
             String data = cursor.getString(dataIndex);
             long dateTaken = cursor.getLong(dateTakenIndex);
-            int width = 0;
-            int height = 0;
-            if (widthIndex >= 0 && heightIndex >= 0) {
-                width = cursor.getInt(widthIndex);
-                height = cursor.getInt(heightIndex);
-            } else {
-                // API 16 之前, 宽高要手动获取
-                Point size = getImageSize(data);
-                width = size.x;
-                height = size.y;
-            }
-
-            // 处理获取到的第一行数据
-            handleMediaRowData(data, dateTaken, width, height);
-
+            int width = cursor.getInt(widthIndex);
+            int height = cursor.getInt(heightIndex);
+            return new ScreenData(data, dateTaken, width, height);
         } catch (Exception e) {
-            Log.e(TAG, "----------------截屏报错：" + e.toString());
             e.printStackTrace();
-
+            return null;
         } finally {
             if (cursor != null && !cursor.isClosed()) {
                 cursor.close();
@@ -231,39 +205,26 @@ public class ScreenShotListenManager {
         }
     }
 
-    private Point getImageSize(String imagePath) {
-        BitmapFactory.Options options = new BitmapFactory.Options();
-        options.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(imagePath, options);
-        return new Point(options.outWidth, options.outHeight);
-    }
-
     /**
      * 处理获取到的一行数据
      */
-    private void handleMediaRowData(String data, long dateTaken, int width, int height) {
-        if (checkScreenShot(data, dateTaken, width, height)) {
-            Log.d(TAG, "---------------ScreenShot: path = " + data + "; size = " + width + " * " + height
-                    + "; date = " + dateTaken);
-            if (mListener != null && !checkCallback(data)) {
-                mListener.onShot(data);
+    private void handleMediaRowData(ScreenData screenData) {
+        if (checkScreenShot(screenData)) {
+            if (mListener != null && !checkCallback(screenData.getData())) {
+                mListener.onShot(screenData.getData());
             }
-        } else {
-            // 如果在观察区间媒体数据库有数据改变，又不符合截屏规则，则输出到 log 待分析
-            Log.w(TAG, "--------------Media content changed, but not screenshot: path = " + data
-                    + "; size = " + width + " * " + height + "; date = " + dateTaken);
         }
     }
 
     /**
      * 判断指定的数据行是否符合截屏条件
      */
-    private boolean checkScreenShot(String data, long dateTaken, int width, int height) {
+    private boolean checkScreenShot(ScreenData screenData) {
         /*
          * 判断依据一: 时间判断
          */
         // 如果加入数据库的时间在开始监听之前, 或者与当前时间相差大于10秒, 则认为当前没有截屏
-        if (dateTaken < mStartListenTime || (System.currentTimeMillis() - dateTaken) > 10 * 1000) {
+        if (screenData.getDateTaken() < mStartListenTime || (System.currentTimeMillis() - screenData.getDateTaken()) > 10 * 1000) {
             return false;
         }
 
@@ -272,8 +233,8 @@ public class ScreenShotListenManager {
          */
         if (sScreenRealSize != null) {
             // 如果图片尺寸超出屏幕, 则认为当前没有截屏
-            if (!((width <= sScreenRealSize.x && height <= sScreenRealSize.y) ||
-                    (height <= sScreenRealSize.x && width <= sScreenRealSize.y))) {
+            if (!((screenData.getWidth() <= sScreenRealSize.x && screenData.getHeight() <= sScreenRealSize.y) ||
+                    (screenData.getHeight() <= sScreenRealSize.x && screenData.getWidth() <= sScreenRealSize.y))) {
                 return false;
             }
         }
@@ -281,6 +242,7 @@ public class ScreenShotListenManager {
         /*
          * 判断依据三: 路径判断
          */
+        String data = screenData.getData();
         if (TextUtils.isEmpty(data)) {
             return false;
         }
@@ -340,17 +302,6 @@ public class ScreenShotListenManager {
         void onShot(String imagePath);
     }
 
-    private static void assertInMainThread() {
-//        if (Looper.myLooper() != Looper.getMainLooper()) {
-//            StackTraceElement[] elements = Thread.currentThread().getStackTrace();
-//            String methodMsg = null;
-//            if (elements != null && elements.length >= 4) {
-//                methodMsg = elements[3].toString();
-//            }
-//            throw new IllegalStateException("Call the method must be in main thread: " + methodMsg);
-//        }
-    }
-
     /**
      * 媒体内容观察者(观察媒体数据库的改变)
      */
@@ -361,17 +312,84 @@ public class ScreenShotListenManager {
         public MediaContentObserver(Uri contentUri, Handler handler) {
             super(handler);
             mContentUri = contentUri;
-            Log.d(TAG, "------------MediaContentObserver  mContentUri:" + mContentUri);
         }
 
         @Override
         public void onChange(boolean selfChange) {
-            Log.d(TAG, "------------MediaContentObserver  onChange:" + selfChange);
             super.onChange(selfChange);
-
-            handleMediaContentChange(mContentUri);
+            // TODO onChange 执行多次解决办法
+            // TODO 解决1：后台情况不予上报
+//            if (PublicPreferencesUtils.isBackGround()) {
+//                return;
+//            }
+            // TODO 解决2：线程池复用
+            // TODO 解决3：相同的uri  过滤
+            // TODO 解决3：分时段监听  【但是就不是实时监听了】
+            handleScreenData(mContentUri);
         }
     }
 
+    /**
+     * TODO 待解决：有些场景 多次 回调 多次创建线程
+     * 改用本地的线程池
+     * @param mContentUri
+     */
+    private void handleScreenData(Uri mContentUri) {
+        Log.d(TAG,"--------------handleScreenData:"+mContentUri);
+        Single.create((SingleOnSubscribe<ScreenData>) e -> {
+            ScreenData screenData = handleMediaContentChange(mContentUri);
+            if (screenData != null) {
+                e.onSuccess(screenData);
+            } else {
+                e.onError(new Exception("获取截图信息失败"));
+            }
+        }).subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(new SingleObserver<ScreenData>() {
+                    @Override
+                    public void onSubscribe(@NonNull Disposable d) {
+                    }
+
+                    @Override
+                    public void onSuccess(@NonNull ScreenData screenData) {
+                        // 处理获取到的第一行数据
+                        handleMediaRowData(screenData);
+                    }
+
+                    @Override
+                    public void onError(@NonNull Throwable e) {
+                    }
+                });
+    }
+
+    private class ScreenData {
+        private final String data;
+        private final long dateTaken;
+        private final int width;
+        private final int height;
+
+        public ScreenData(String data, long dateTaken, int width, int height) {
+            this.data = data;
+            this.dateTaken = dateTaken;
+            this.width = width;
+            this.height = height;
+        }
+
+        public String getData() {
+            return data;
+        }
+
+        public long getDateTaken() {
+            return dateTaken;
+        }
+
+        public int getWidth() {
+            return width;
+        }
+
+        public int getHeight() {
+            return height;
+        }
+    }
 }
 
